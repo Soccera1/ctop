@@ -46,6 +46,15 @@
 #define HISTORY_SIZE 120
 #define MAX_DISKS 32
 
+#define PROC_PID_WIDTH 8
+#define PROC_CPU_WIDTH 6
+#define PROC_MEM_WIDTH 8
+#define PROC_PROG_MIN_WIDTH 8
+#define PROC_CMD_MIN_WIDTH 8
+#define PROC_USER_MIN_WIDTH 6
+#define PROC_COLUMN_SPACING 4
+#define PROC_NARROW_OFFSET 1
+
 /* Superscript numbers */
 static const char *SUPERSCRIPT[] = {"", "¹", "²", "³", "⁴", "⁵"};
 
@@ -80,6 +89,7 @@ typedef struct {
     long prev_stime;
     long mem_rss;
     float cpu_percent;
+    float cpu_percent_lazy;
     float mem_percent;
 } ProcessInfo;
 
@@ -148,6 +158,8 @@ static int g_scroll_offset = 0;
 #define SORT_MAX 5
 static int g_sort_mode = SORT_CPU_LAZY;
 static int g_refresh_rate_ms = REFRESH_RATE_MS;
+static float g_elapsed_seconds = 1.0f;
+static long g_clk_tck = 0;
 
 const char *get_sort_name(void) {
     switch (g_sort_mode) {
@@ -169,13 +181,25 @@ int is_number(const char *str) {
 }
 
 void get_username(int uid, char *buf, size_t buflen) {
-    struct passwd *pw = getpwuid(uid);
-    if (pw) {
-        strncpy(buf, pw->pw_name, buflen - 1);
+    struct passwd pwd;
+    struct passwd *result;
+    char *pwdbuf;
+    size_t pwdbuflen = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (pwdbuflen == (size_t)-1) pwdbuflen = 16384;
+    
+    pwdbuf = malloc(pwdbuflen);
+    if (!pwdbuf) {
+        snprintf(buf, buflen, "%d", uid);
+        return;
+    }
+    
+    if (getpwuid_r(uid, &pwd, pwdbuf, pwdbuflen, &result) == 0 && result) {
+        strncpy(buf, pwd.pw_name, buflen - 1);
         buf[buflen - 1] = '\0';
     } else {
         snprintf(buf, buflen, "%d", uid);
     }
+    free(pwdbuf);
 }
 
 void format_bytes(unsigned long bytes, char *buf, size_t buflen) {
@@ -323,6 +347,17 @@ void parse_net_stats(void) {
     g_stats.prev_net_tx = total_tx;
 }
 
+static unsigned int get_sector_size(const char *name) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/block/%s/queue/hw_sector_size", name);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 512;
+    unsigned int size = 512;
+    fscanf(fp, "%u", &size);
+    fclose(fp);
+    return size > 0 ? size : 512;
+}
+
 void parse_disk_stats(void) {
     FILE *fp = fopen("/proc/diskstats", "r");
     if (!fp) return;
@@ -342,14 +377,16 @@ void parse_disk_stats(void) {
                 strncmp(name, "ram", 3) == 0 ||
                 strncmp(name, "dm-", 3) == 0) continue;
             
+            unsigned int sector_size = get_sector_size(name);
+            
             DiskInfo *disk = &new_disks[new_disk_count];
             memset(disk, 0, sizeof(DiskInfo));
             strncpy(disk->name, name, sizeof(disk->name) - 1);
             
             for (int i = 0; i < g_stats.num_disks; i++) {
                 if (strcmp(g_stats.disks[i].name, name) == 0) {
-                    unsigned long long read_diff = (read_sectors - g_stats.disks[i].read_sectors) * 512;
-                    unsigned long long write_diff = (write_sectors - g_stats.disks[i].write_sectors) * 512;
+                    unsigned long long read_diff = (read_sectors - g_stats.disks[i].read_sectors) * sector_size;
+                    unsigned long long write_diff = (write_sectors - g_stats.disks[i].write_sectors) * sector_size;
                     disk->read_speed = read_diff / 1024.0f;
                     disk->write_speed = write_diff / 1024.0f;
                     memcpy(disk->history_rx, g_stats.disks[i].history_rx, sizeof(disk->history_rx));
@@ -410,11 +447,13 @@ int compare_processes(const void *a, const void *b) {
     const ProcessInfo *pb = (const ProcessInfo *)b;
     
     switch (g_sort_mode) {
-        case SORT_CPU_LAZY:
         case SORT_CPU_DIRECT:
-            /* Both CPU modes sort by cpu_percent */
             if (pb->cpu_percent > pa->cpu_percent) return 1;
             if (pb->cpu_percent < pa->cpu_percent) return -1;
+            break;
+        case SORT_CPU_LAZY:
+            if (pb->cpu_percent_lazy > pa->cpu_percent_lazy) return 1;
+            if (pb->cpu_percent_lazy < pa->cpu_percent_lazy) return -1;
             break;
         case SORT_MEM:
             if (pb->mem_rss > pa->mem_rss) return 1;
@@ -471,6 +510,7 @@ void parse_processes(void) {
             if (!end) { fclose(fp); continue; }
             
             int comm_len = end - p - 1;
+            if (comm_len < 0) comm_len = 0;
             if (comm_len >= 255) comm_len = 255;
             strncpy(proc->name, p + 1, comm_len);
             proc->name[comm_len] = '\0';
@@ -536,12 +576,21 @@ void parse_processes(void) {
                     long delta_stime = current_stime - prev_procs[j].prev_stime;
                     long delta_total = delta_utime + delta_stime;
                     
-                    /* CPU% = (delta_ticks / ticks_per_second) / elapsed_seconds * 100 / num_cores */
-                    /* With 100Hz ticks and 1 second refresh: (delta_total / 100 * 100) / num_cores = delta_total / num_cores */
-                    if (g_stats.num_cores > 0) {
-                        proc->cpu_percent = (float)delta_total / g_stats.num_cores;
+                    /* CPU% = (delta_ticks / clock_ticks_per_second) / elapsed_seconds * 100 / num_cores */
+                    if (g_clk_tck <= 0) g_clk_tck = sysconf(_SC_CLK_TCK);
+                    if (g_clk_tck <= 0) g_clk_tck = 100;
+                    
+                    float cpu_raw = 0.0f;
+                    if (g_stats.num_cores > 0 && g_elapsed_seconds > 0) {
+                        cpu_raw = (delta_total * 100.0f) / (g_clk_tck * g_elapsed_seconds * g_stats.num_cores);
+                    }
+                    proc->cpu_percent = cpu_raw;
+                    
+                    /* Lazy mode: exponential moving average (smoothing factor 0.3) */
+                    if (proc->cpu_percent_lazy > 0 || cpu_raw > 0) {
+                        proc->cpu_percent_lazy = proc->cpu_percent_lazy * 0.7f + cpu_raw * 0.3f;
                     } else {
-                        proc->cpu_percent = delta_total;
+                        proc->cpu_percent_lazy = cpu_raw;
                     }
                     break;
                 }
@@ -940,15 +989,15 @@ void draw_process_list(int x, int y, int w, int h) {
     int max_line = y + h - 1;
     
     /* Calculate column widths based on available width */
-    int pid_width = 8;
-    int cpu_width = 6;
-    int mem_width = 8;
-    int min_prog_width = 8;
-    int min_cmd_width = 8;
-    int min_user_width = 6;
+    int pid_width = PROC_PID_WIDTH;
+    int cpu_width = PROC_CPU_WIDTH;
+    int mem_width = PROC_MEM_WIDTH;
+    int min_prog_width = PROC_PROG_MIN_WIDTH;
+    int min_cmd_width = PROC_CMD_MIN_WIDTH;
+    int min_user_width = PROC_USER_MIN_WIDTH;
     
     /* Available width for variable columns */
-    int fixed_width = pid_width + mem_width + cpu_width + 4; /* spaces between */
+    int fixed_width = pid_width + mem_width + cpu_width + PROC_COLUMN_SPACING;
     int var_width = w - fixed_width;
     
     /* Determine what columns to show based on width */
@@ -960,7 +1009,7 @@ void draw_process_list(int x, int y, int w, int h) {
         /* Very narrow - just show PID, Program, CPU% */
         show_user = 0;
         show_cmd = 0;
-        prog_width = var_width - 1;
+        prog_width = var_width - PROC_NARROW_OFFSET;
         if (prog_width < 6) prog_width = 6;
     } else if (var_width < min_prog_width + min_cmd_width + min_user_width) {
         /* Narrow - show PID, Program, User, CPU% */
@@ -1434,6 +1483,7 @@ int main(int argc, char *argv[]) {
     draw_screen();
     
     int64_t last_update = get_time_ms();
+    int64_t prev_update = last_update;
     
     while (g_running) {
         int w = tb_width();
@@ -1525,9 +1575,12 @@ int main(int argc, char *argv[]) {
             if (pane_toggled) {
                 save_settings();
             }
+            g_elapsed_seconds = (now - prev_update) / 1000.0f;
+            if (g_elapsed_seconds <= 0) g_elapsed_seconds = 1.0f;
             if (!in_error_mode || pane_toggled || sort_changed) {
                 update_stats();
             }
+            prev_update = now;
             last_update = now;
             draw_screen();
         }
