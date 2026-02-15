@@ -1493,7 +1493,7 @@ int main(int argc, char *argv[]) {
         int in_error_mode = (w < min_w || h < min_h);
         
         int64_t now = get_time_ms();
-        int64_t time_until_update = REFRESH_RATE_MS - (now - last_update);
+        int64_t time_until_update = g_refresh_rate_ms - (now - last_update);
         if (time_until_update < 0) time_until_update = 0;
         
         struct tb_event ev;
