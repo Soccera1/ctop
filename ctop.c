@@ -79,6 +79,7 @@ typedef struct {
 /* Process information structure */
 typedef struct {
     int pid;
+    int uid;
     char name[256];
     char cmdline[512];
     char user[32];
@@ -542,8 +543,11 @@ void parse_processes(void) {
                 }
                 fclose(status_fp);
             }
-            
-            get_username(uid, proc->user, sizeof(proc->user));
+
+            if (proc->uid != uid) {
+                proc->uid = uid;
+                get_username(uid, proc->user, sizeof(proc->user));
+            }
             
             snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
             FILE *cmd_fp = fopen(path, "r");
