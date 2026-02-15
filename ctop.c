@@ -149,6 +149,46 @@ static SystemStats g_stats = {0};
 static int g_running = 1;
 static int g_selected_process = 0;
 static int g_scroll_offset = 0;
+static int g_signal_menu_active = 0;
+static int g_signal_selected = 0;
+static int g_confirm_menu_active = 0;
+static int g_confirm_signal = 0;
+static int g_signal_sent = 0;
+static int g_signal_sent_pid = 0;
+static int g_signal_sent_sig = 0;
+static int64_t g_signal_sent_time = 0;
+
+typedef struct {
+    int signum;
+    const char *name;
+    const char *desc;
+} SignalInfo;
+
+static const SignalInfo SIGNALS[] = {
+    {1, "SIGHUP", "Hangup"},
+    {2, "SIGINT", "Interrupt (Ctrl+C)"},
+    {3, "SIGQUIT", "Quit"},
+    {6, "SIGABRT", "Abort"},
+    {9, "SIGKILL", "Kill (cannot be caught)"},
+    {11, "SIGSEGV", "Segmentation fault"},
+    {15, "SIGTERM", "Terminate (graceful)"},
+    {17, "SIGSTOP", "Stop (cannot be caught)"},
+    {18, "SIGTSTP", "Stop (Ctrl+Z)"},
+    {19, "SIGCONT", "Continue"},
+    {20, "SIGTTIN", "Background read"},
+    {21, "SIGTTOU", "Background write"},
+    {22, "SIGUSR1", "User-defined 1"},
+    {23, "SIGUSR2", "User-defined 2"},
+    {24, "SIGWINCH", "Window changed"},
+    {25, "SIGIO", "I/O possible"},
+    {26, "SIGSYS", "Bad system call"},
+};
+static const int NUM_SIGNALS = sizeof(SIGNALS) / sizeof(SIGNALS[0]);
+
+int send_signal_to_process(int pid, int sig) {
+    if (pid <= 0) return -1;
+    return kill(pid, sig);
+}
 
 /* Sort modes */
 #define SORT_CPU_LAZY 0
@@ -1163,7 +1203,146 @@ void draw_top_bar(int w) {
 
 void draw_help_bar(int y, int w) {
     tb_printf(2, y, COLOR_FG, COLOR_BG, 
-              "1-5:toggle | C-f/b:sort | C-n/p:nav | C-v/M-v:page | C-a/e:home/end | q:quit");
+              "1-5:toggle | C-f/b:sort | C-n/p:nav | C-v/M-v:page | C-a/e:home/end | k:t:s:signal | q:quit");
+}
+
+void draw_signal_menu(int w, int h) {
+    int menu_w = 40;
+    int menu_h = NUM_SIGNALS + 4;
+    int x = (w - menu_w) / 2;
+    int y = (h - menu_h) / 2;
+    
+    if (x < 2) x = 2;
+    if (y < 2) y = 2;
+    
+    if (g_selected_process < 0 || g_selected_process >= g_stats.process_count) return;
+    ProcessInfo *proc = &g_stats.processes[g_selected_process];
+    
+    for (int dy = 0; dy < menu_h; dy++) {
+        for (int dx = 0; dx < menu_w; dx++) {
+            uint32_t fg = COLOR_HEADER;
+            uint32_t bg = COLOR_HEADER;
+            uint32_t ch = ' ';
+            
+            if (dy == 0) {
+                if (dx == 0) ch = '+';
+                else if (dx == menu_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dy == menu_h - 1) {
+                if (dx == 0) ch = '+';
+                else if (dx == menu_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dx == 0 || dx == menu_w - 1) {
+                ch = '|';
+            }
+            
+            tb_set_cell(x + dx, y + dy, ch, fg, bg);
+        }
+    }
+    
+    tb_printf(x + 2, y, TB_BLACK, COLOR_HEADER, "Send signal to PID %d (%s)", proc->pid, proc->name);
+    
+    if (g_signal_selected < 0) g_signal_selected = 0;
+    if (g_signal_selected >= NUM_SIGNALS) g_signal_selected = NUM_SIGNALS - 1;
+    
+    int scroll = 0;
+    if (g_signal_selected > menu_h - 4) {
+        scroll = g_signal_selected - (menu_h - 4);
+    }
+    if (scroll < 0) scroll = 0;
+    
+    for (int i = 0; i < NUM_SIGNALS && i < menu_h - 3; i++) {
+        int idx = i + scroll;
+        if (idx >= NUM_SIGNALS) break;
+        
+        int row = y + 2 + i;
+        uint32_t fg = COLOR_FG;
+        uint32_t bg = COLOR_HEADER;
+        
+        if (idx == g_signal_selected) {
+            fg = TB_BLACK;
+            bg = COLOR_HEADER;
+        }
+        
+        tb_printf(x + 2, row, fg, bg, "%-8s %2d  %s", SIGNALS[idx].name, SIGNALS[idx].signum, SIGNALS[idx].desc);
+    }
+    
+    tb_printf(x + 2, y + menu_h - 1, COLOR_HEADER, COLOR_HEADER, "Up/Dn:select Enter:send Esc:close");
+}
+
+void draw_signal_sent_message(int w, int h) {
+    int msg_w = 35;
+    int msg_h = 3;
+    int x = (w - msg_w) / 2;
+    int y = (h - msg_h) / 2;
+    
+    if (x < 2) x = 2;
+    if (y < 2) y = 2;
+    
+    const char *sig_name = (g_signal_sent_sig == SIGKILL) ? "SIGKILL" : 
+                          (g_signal_sent_sig == SIGTERM) ? "SIGTERM" : "signal";
+    
+    for (int dy = 0; dy < msg_h; dy++) {
+        for (int dx = 0; dx < msg_w; dx++) {
+            uint32_t fg = COLOR_LOW;
+            uint32_t bg = COLOR_LOW;
+            uint32_t ch = ' ';
+            
+            if (dy == 0) {
+                if (dx == 0) ch = '+';
+                else if (dx == msg_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dy == msg_h - 1) {
+                if (dx == 0) ch = '+';
+                else if (dx == msg_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dx == 0 || dx == msg_w - 1) {
+                ch = '|';
+            }
+            
+            tb_set_cell(x + dx, y + dy, ch, fg, bg);
+        }
+    }
+    
+    tb_printf(x + 2, y + 1, TB_BLACK, COLOR_LOW, "Sent %s to PID %d", sig_name, g_signal_sent_pid);
+}
+
+void draw_confirm_menu(int w, int h, const char *sig_name) {
+    int menu_w = 45;
+    int menu_h = 6;
+    int x = (w - menu_w) / 2;
+    int y = (h - menu_h) / 2;
+    
+    if (x < 2) x = 2;
+    if (y < 2) y = 2;
+    
+    if (g_selected_process < 0 || g_selected_process >= g_stats.process_count) return;
+    ProcessInfo *proc = &g_stats.processes[g_selected_process];
+    
+    for (int dy = 0; dy < menu_h; dy++) {
+        for (int dx = 0; dx < menu_w; dx++) {
+            uint32_t fg = COLOR_HEADER;
+            uint32_t bg = COLOR_HEADER;
+            uint32_t ch = ' ';
+            
+            if (dy == 0) {
+                if (dx == 0) ch = '+';
+                else if (dx == menu_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dy == menu_h - 1) {
+                if (dx == 0) ch = '+';
+                else if (dx == menu_w - 1) ch = '+';
+                else ch = '-';
+            } else if (dx == 0 || dx == menu_w - 1) {
+                ch = '|';
+            }
+            
+            tb_set_cell(x + dx, y + dy, ch, fg, bg);
+        }
+    }
+    
+    tb_printf(x + 2, y + 1, TB_BLACK, COLOR_HEADER, "Send %s to PID %d (%s)?", sig_name, proc->pid, proc->name);
+    tb_printf(x + 2, y + 3, COLOR_FG, COLOR_HEADER, "  Yes: Enter    No: Esc");
 }
 
 /* Calculate minimum required dimensions - optimized for density like btop++ */
@@ -1379,6 +1558,22 @@ void draw_screen(void) {
     /* Help bar at bottom */
     draw_help_bar(h - 1, w);
     
+    /* Draw signal menu overlay if active */
+    if (g_signal_menu_active) {
+        draw_signal_menu(w, h);
+    }
+    
+    /* Draw confirmation menu overlay if active */
+    if (g_confirm_menu_active) {
+        const char *sig_name = (g_confirm_signal == SIGKILL) ? "SIGKILL" : "SIGTERM";
+        draw_confirm_menu(w, h, sig_name);
+    }
+    
+    /* Draw signal sent message */
+    if (g_signal_sent) {
+        draw_signal_sent_message(w, h);
+    }
+    
     tb_present();
 }
 
@@ -1539,6 +1734,58 @@ int main(int argc, char *argv[]) {
                     g_sort_mode = (g_sort_mode - 1 + SORT_MAX) % SORT_MAX;
                     need_redraw = 1;
                     sort_changed = 1;
+                } else if (g_signal_menu_active) {
+                    if (ev.key == TB_KEY_ESC) {
+                        g_signal_menu_active = 0;
+                        need_redraw = 1;
+                    } else if (ev.key == TB_KEY_ARROW_UP || ev.key == TB_KEY_CTRL_P) {
+                        if (g_signal_selected > 0) g_signal_selected--;
+                        need_redraw = 1;
+                    } else if (ev.key == TB_KEY_ARROW_DOWN || ev.key == TB_KEY_CTRL_N) {
+                        if (g_signal_selected < NUM_SIGNALS - 1) g_signal_selected++;
+                        need_redraw = 1;
+                    } else if (ev.key == TB_KEY_ENTER) {
+                        if (g_selected_process >= 0 && g_selected_process < g_stats.process_count) {
+                            int pid = g_stats.processes[g_selected_process].pid;
+                            int sig = SIGNALS[g_signal_selected].signum;
+                            send_signal_to_process(pid, sig);
+                            g_signal_sent = 1;
+                            g_signal_sent_pid = pid;
+                            g_signal_sent_sig = sig;
+                            g_signal_sent_time = get_time_ms();
+                        }
+                        g_signal_menu_active = 0;
+                        need_redraw = 1;
+                    }
+                } else if (g_confirm_menu_active) {
+                    if (ev.key == TB_KEY_ESC) {
+                        g_confirm_menu_active = 0;
+                        need_redraw = 1;
+                    } else if (ev.key == TB_KEY_ENTER) {
+                        if (g_selected_process >= 0 && g_selected_process < g_stats.process_count) {
+                            int pid = g_stats.processes[g_selected_process].pid;
+                            int sig = g_confirm_signal;
+                            send_signal_to_process(pid, sig);
+                            g_signal_sent = 1;
+                            g_signal_sent_pid = pid;
+                            g_signal_sent_sig = sig;
+                            g_signal_sent_time = get_time_ms();
+                        }
+                        g_confirm_menu_active = 0;
+                        need_redraw = 1;
+                    }
+                } else if (g_show_proc && g_stats.process_count > 0 && (ev.ch == 'k' || ev.ch == 'K')) {
+                    g_confirm_menu_active = 1;
+                    g_confirm_signal = SIGKILL;
+                    need_redraw = 1;
+                } else if (g_show_proc && g_stats.process_count > 0 && (ev.ch == 't' || ev.ch == 'T')) {
+                    g_confirm_menu_active = 1;
+                    g_confirm_signal = SIGTERM;
+                    need_redraw = 1;
+                } else if (g_show_proc && g_stats.process_count > 0 && (ev.ch == 's' || ev.ch == 'S')) {
+                    g_signal_menu_active = 1;
+                    g_signal_selected = 0;
+                    need_redraw = 1;
                 } else if (ev.ch == 'q' || ev.ch == 'Q' || ev.key == TB_KEY_ESC || 
                           ev.key == TB_KEY_CTRL_C) {
                     g_running = 0;
@@ -1571,6 +1818,12 @@ int main(int argc, char *argv[]) {
         
         if (need_redraw) {
             draw_screen();
+        }
+        
+        /* Clear signal sent message after 2 seconds */
+        if (g_signal_sent && get_time_ms() - g_signal_sent_time > 2000) {
+            g_signal_sent = 0;
+            need_redraw = 1;
         }
         
         /* Update stats and redraw periodically, or immediately after pane toggle or sort change */
